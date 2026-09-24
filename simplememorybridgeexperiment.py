@@ -8,6 +8,7 @@
 #   "wandb>=0.16",
 #   "huggingface_hub>=0.24",
 #   "accelerate>=0.30",
+#   "bitsandbytes>=0.50.2"
 # ]
 # ///
 """Train the MemoryBridgeLLM compressor + bridge on long chat data.
