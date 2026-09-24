@@ -851,6 +851,18 @@ def count_parameters(module):
     return total, trainable
 
 
+def sum_param_counts(*counts):
+    """Element-wise sum of (total, trainable) tuples returned by count_parameters.
+
+    `+` on tuples concatenates instead of adding element-wise, which used to
+    produce a 6-tuple for the recursion entry and crash the unpack in
+    `sum(t for t, _ in param_report.values())`.
+    """
+    total = sum(c[0] for c in counts)
+    trainable = sum(c[1] for c in counts)
+    return total, trainable
+
+
 def batch_compression_stats(model, seq_len):
     """(num_chunks, num_super_tokens, compression_ratio, level, truncated) for a padded seq_len."""
     if seq_len <= model.max_window:
@@ -1094,7 +1106,11 @@ def run(**cfg):
         'encoder': count_parameters(model.encoder),
         'compressor': count_parameters(model.compressor),
         'bridge': count_parameters(model.bridge),
-        'recursion': count_parameters(model.recursion_compressor) + count_parameters(model.recursion_norm) + count_parameters(model.recursion_bridge),
+        'recursion': sum_param_counts(
+            count_parameters(model.recursion_compressor),
+            count_parameters(model.recursion_norm),
+            count_parameters(model.recursion_bridge),
+        ),
     }
     total_params = sum(t for t, _ in param_report.values())
     trainable_params = sum(tr for _, tr in param_report.values())
