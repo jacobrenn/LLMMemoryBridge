@@ -458,6 +458,33 @@ class MemoryBridgeLLM(nn.Module):
     # Generation
     # ------------------------------------------------------------------
 
+    def _compress_tokens(self, token_ids, llm_tokenizer, encoder_tokenizer):
+        """Compress a raw list of token ids into super-token embeddings.
+
+        Used during rolling generation to fold newly-overflowing tokens back
+        into the memory prefix. Returns a tensor of shape
+        (1, num_slots, llm_hidden).
+        """
+        device = next(self.parameters()).device
+        text = llm_tokenizer.decode(token_ids, skip_special_tokens = False)
+        enc = encoder_tokenizer(
+            text,
+            return_tensors = 'pt',
+            truncation = True,
+            max_length = self.compression_window,
+            add_special_tokens = True,
+        ).to(device)
+
+        if self.encoder_trainable:
+            enc_out = self.encoder(**enc)
+        else:
+            with torch.no_grad():
+                enc_out = self.encoder(**enc)
+        memory = enc_out.last_hidden_state
+        pad_mask = (enc['attention_mask'] == 0)
+        latents = self.compressor(memory, memory_key_padding_mask = pad_mask)
+        return self.bridge(self.post_norm(latents))
+
     @torch.no_grad()
     def generate(
         self,
@@ -471,14 +498,17 @@ class MemoryBridgeLLM(nn.Module):
     ):
         """Greedy autoregressive generation through the memory bridge.
 
-        The overflow region is compressed exactly once; the growing suffix of
-        newly generated tokens is appended to the active window each step.
+        The initial overflow is compressed once. As generation proceeds, the
+        active window is held to ``max_window`` tokens: any tokens that slide
+        out of the window are buffered and re-compressed into additional
+        super-tokens, which are appended to the memory prefix. This keeps the
+        total sequence length bounded no matter how many tokens are generated.
         """
         self.eval()
         device = input_ids.device
         B, T = input_ids.shape
 
-        # Compress overflow once, if needed
+        # Compress the initial overflow, if any
         memory_embeds = self.compress_context(input_ids, llm_tokenizer, encoder_tokenizer, attention_mask)
         if memory_embeds is not None:
             overflow_len = T - self.max_window
@@ -489,8 +519,6 @@ class MemoryBridgeLLM(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        num_mem = memory_embeds.shape[1] if memory_embeds is not None else 0
-
         if stop_token_ids is None:
             stop_token_ids = set()
         else:
@@ -498,11 +526,44 @@ class MemoryBridgeLLM(nn.Module):
         if eos_token_id is not None:
             stop_token_ids.add(eos_token_id)
 
+        # Buffer for generated tokens that have slid out of the active window
+        # but have not yet been re-compressed into super-tokens.
+        pending_overflow = []
+
         generated = torch.full((B, 1), -1, dtype = torch.long, device = device)
         finished = torch.zeros(B, dtype = torch.bool, device = device)
         generated_lists = [[] for _ in range(B)]
 
         for _ in range(max_new_tokens):
+            # --------------------------------------------------------------
+            # Rolling window: if the active window is full, slide the oldest
+            # token(s) out and buffer them for re-compression.
+            # --------------------------------------------------------------
+            while input_ids.shape[1] >= self.max_window:
+                popped = input_ids[:, 0].item()
+                pending_overflow.append(popped)
+                input_ids = input_ids[:, 1:]
+                if attention_mask is not None:
+                    attention_mask = attention_mask[:, 1:]
+
+            # Re-compress once we have a full compression_window of overflow.
+            if len(pending_overflow) >= self.compression_window:
+                new_mem = self._compress_tokens(pending_overflow, llm_tokenizer, encoder_tokenizer)
+                memory_embeds = new_mem if memory_embeds is None else torch.cat([memory_embeds, new_mem], dim = 1)
+                pending_overflow.clear()
+
+            # Safety valve: if the memory prefix itself is about to exceed the
+            # model's positional budget, flush early.
+            num_mem = memory_embeds.shape[1] if memory_embeds is not None else 0
+            if num_mem + self.max_window >= _max_position_embeddings(self.llm.config) and pending_overflow:
+                new_mem = self._compress_tokens(pending_overflow, llm_tokenizer, encoder_tokenizer)
+                memory_embeds = new_mem if memory_embeds is None else torch.cat([memory_embeds, new_mem], dim = 1)
+                pending_overflow.clear()
+                num_mem = memory_embeds.shape[1]
+
+            # --------------------------------------------------------------
+            # Build embeddings for the current step
+            # --------------------------------------------------------------
             active_ids = torch.cat([input_ids, generated[:, 1:]], dim = 1) if generated.shape[1] > 1 else input_ids
             active_embeds = self.llm.get_input_embeddings()(active_ids)
 
@@ -519,7 +580,6 @@ class MemoryBridgeLLM(nn.Module):
             next_token = outputs.logits[:, -1, :].argmax(dim = -1, keepdim = True)
             generated = torch.cat([generated, next_token], dim = 1)
 
-            newly_finished = False
             for b in range(B):
                 tok = next_token[b].item()
                 if finished[b]:
@@ -527,7 +587,6 @@ class MemoryBridgeLLM(nn.Module):
                 generated_lists[b].append(tok)
                 if tok in stop_token_ids:
                     finished[b] = True
-                    newly_finished = True
 
             if finished.all():
                 break
