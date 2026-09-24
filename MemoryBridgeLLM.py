@@ -35,6 +35,19 @@ def _max_position_embeddings(config, default=512):
 
 
 class LatentCompressor(nn.Module):
+    """LatentCompressor Network which compresses existing embeddings down using Perceiver-style attention
+
+    Parameters
+    ----------
+    enc_dim: int
+        The input encoding dimension from the encoding model
+    num_slots: int (default 128)
+        Number of "super tokens" to encode to
+    num_heads: int (default 8)
+        The number of attention heads to use in the decoder layer
+    num_layers: int (default 2)
+        The number of decoder layers to use
+    """
     def __init__(
         self,
         enc_dim,
@@ -87,6 +100,31 @@ class MemoryBridgeConfig:
 
 
 class MemoryBridgeLLM(nn.Module):
+    """
+    Memory Bridge LLM
+
+    Parameters
+    ----------
+    llm_model: PyTorch model
+        The LLM to use for generation
+    encoder_model: PyTorch model
+        The encoder to use for generating embeddings
+    max_window int or None (default None)
+        The maximum token window that can be used. If None, determines the value from the encoder and LLMs
+    compression_window: int (default 8192)
+        The number of tokens to compress into one set of "super token" slots
+    compression_slots: int (default 128)
+        The number of "super tokens" to compress each compression window to
+    compression_n_heads: int (default 8)
+        The number of attention heads in the LatentCompressor model
+    compression_n_layers: int (default 2)
+        The number of transformer decoder layers to use in the LatentCompressor model
+    llm_trainable: bool (default False)
+        Whether the LLM is trainable
+    encoder_trainable: bool (default False)
+        Whether the encoder is trainable
+
+    """
 
     CONFIG_FILE = 'memory_bridge_config.json'
 
