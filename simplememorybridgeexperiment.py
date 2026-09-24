@@ -51,6 +51,13 @@ Architecture:
       latent slots over the encoder hidden states.
     - A linear bridge projects the resulting latents into the LLM's embedding
       space. These "super-tokens" are prepended to the embedded active window.
+    - A shared recursive compressor (latent compressor + norm + bridge, all in
+      LLM embedding space) repeatedly folds super-token memory back into itself
+      whenever the memory prefix threatens to exceed the LLM's positional
+      budget. Because each recursion shrinks the memory by a fixed ratio, this
+      bounds the LLM sequence length no matter how long the raw context is --
+      in theory, unbounded context. As a final backstop the oldest super-tokens
+      are dropped if recursion alone cannot fit the budget.
 
 The module exposes `forward` (returns logits over the super-token + active
 window region), `generate` (real autoregressive generation that reuses the
@@ -139,6 +146,10 @@ class MemoryBridgeConfig:
     compression_slots: int = 128
     compression_n_heads: int = 8
     compression_n_layers: int = 2
+    max_levels: int = None
+    recursion_window: int = 512
+    recursion_n_heads: int = 8
+    recursion_n_layers: int = 1
     llm_trainable: bool = False
     encoder_trainable: bool = False
 
@@ -163,6 +174,18 @@ class MemoryBridgeLLM(nn.Module):
         The number of attention heads in the LatentCompressor model
     compression_n_layers: int (default 2)
         The number of transformer decoder layers to use in the LatentCompressor model
+    max_levels: int or None (default None)
+        Maximum compression depth. Level 1 is the encoder/compressor/bridge
+        path; levels >= 2 recursively compress super-token memory using the
+        shared recursive compressor. If None, recursion continues until the
+        memory fits the positional budget (unbounded in theory).
+    recursion_window: int (default 512)
+        Number of super-tokens grouped and compressed into one set of
+        level-(N+1) slots at each recursion step.
+    recursion_n_heads: int (default 8)
+        Number of attention heads in the recursive compressor.
+    recursion_n_layers: int (default 1)
+        Number of transformer decoder layers in the recursive compressor.
     llm_trainable: bool (default False)
         Whether the LLM is trainable
     encoder_trainable: bool (default False)
@@ -181,6 +204,10 @@ class MemoryBridgeLLM(nn.Module):
         compression_slots = 128,
         compression_n_heads = 8,
         compression_n_layers = 2,
+        max_levels = None,
+        recursion_window = 512,
+        recursion_n_heads = 8,
+        recursion_n_layers = 1,
         llm_trainable = False,
         encoder_trainable = False
     ):
@@ -207,11 +234,29 @@ class MemoryBridgeLLM(nn.Module):
         else:
             raise ValueError(f'max_window is set to {max_window}, but the maximum allowed window by encoder and LLM is {max_window_allowed}')
 
+        # Leave room for at least one set of super-tokens. If max_window
+        # consumes the entire positional budget, a single compression chunk
+        # would already overflow it (and if packing length <= max_window the
+        # compression path never even receives gradient).
+        if self.max_window > llm_max_window - compression_slots:
+            clamped = max(llm_max_window - compression_slots, 1)
+            print(
+                f'[memory-bridge] WARNING: max_window={self.max_window} leaves no room for '
+                f'{compression_slots} super-tokens in the LLM positional budget '
+                f'({llm_max_window}); clamping max_window to {clamped}.'
+            )
+            self.max_window = clamped
+
         # Set the compression_window, compression slots, number of attention heads for compressor, and number of layers for the compressor
         self.compression_window = compression_window
         self.compression_slots = compression_slots
         self.compression_n_heads = compression_n_heads
         self.compression_n_layers = compression_n_layers
+        # Recursion (levels >= 2): shared compressor over super-token memory
+        self.max_levels = max_levels
+        self.recursion_window = recursion_window
+        self.recursion_n_heads = recursion_n_heads
+        self.recursion_n_layers = recursion_n_layers
 
         # Create the compressor
         self.compressor = LatentCompressor(
@@ -230,6 +275,20 @@ class MemoryBridgeLLM(nn.Module):
         # LayerNorm before the bridge keeps super-token activations in a sane
         # range early in training; compressor/bridge weights are initialized.
         self.post_norm = nn.LayerNorm(self.encoder.config.hidden_size)
+
+        # Recursive (level >= 2) compressor: operates entirely in LLM embedding
+        # space, folding super-token memory back into compression_slots tokens.
+        # One shared module is used for every deeper level.
+        llm_hidden = self.llm.config.hidden_size
+        self.recursion_compressor = LatentCompressor(
+            enc_dim = llm_hidden,
+            num_slots = self.compression_slots,
+            num_heads = self.recursion_n_heads,
+            num_layers = self.recursion_n_layers
+        )
+        self.recursion_norm = nn.LayerNorm(llm_hidden)
+        self.recursion_bridge = nn.Linear(llm_hidden, llm_hidden)
+
         self._init_bridge_weights()
         self._apply_freezing()
 
@@ -258,7 +317,8 @@ class MemoryBridgeLLM(nn.Module):
         touched. Every nn.Linear found inside them is Xavier-initialized with
         zeroed bias. Pretrained LLM and encoder weights are never modified.
         """
-        for module in (self.compressor, self.bridge, self.post_norm):
+        for module in (self.compressor, self.bridge, self.post_norm,
+                       self.recursion_compressor, self.recursion_norm, self.recursion_bridge):
             for submodule in module.modules():
                 if isinstance(submodule, nn.Linear):
                     nn.init.xavier_uniform_(submodule.weight)
@@ -276,6 +336,12 @@ class MemoryBridgeLLM(nn.Module):
         for p in self.bridge.parameters():
             p.requires_grad = True
         for p in self.post_norm.parameters():
+            p.requires_grad = True
+        for p in self.recursion_compressor.parameters():
+            p.requires_grad = True
+        for p in self.recursion_norm.parameters():
+            p.requires_grad = True
+        for p in self.recursion_bridge.parameters():
             p.requires_grad = True
 
     def set_llm_trainable(self, flag):
@@ -381,15 +447,91 @@ class MemoryBridgeLLM(nn.Module):
         # Concatenate all chunk super tokens into one memory tensor
         memory_embeds = torch.cat(super_token_sets, dim = 1)
 
+        # Enforce the positional budget via recursion / truncation
+        memory_embeds, _, _ = self._fit_memory_budget(memory_embeds)
+
         return memory_embeds
+
+    # ------------------------------------------------------------------
+    # Recursive compression (levels >= 2)
+    # ------------------------------------------------------------------
+
+    def _memory_budget(self):
+        """Number of super-tokens that fit alongside the active window."""
+        return _max_position_embeddings(self.llm.config) - self.max_window
+
+    def _compress_memory_level(self, memory_embeds):
+        """Fold super-token memory one level deeper.
+
+        Groups the [B, M, llm_hidden] memory into `recursion_window`-sized
+        chunks and compresses each chunk down to `compression_slots` tokens
+        using the shared recursive compressor (all in LLM embedding space).
+        Memory is dense, so no padding mask is needed.
+        """
+        B, M, _ = memory_embeds.shape
+        out_sets = []
+        for start in range(0, M, self.recursion_window):
+            group = memory_embeds[:, start:start + self.recursion_window]
+            latents = self.recursion_compressor(group)
+            out_sets.append(self.recursion_bridge(self.recursion_norm(latents)))
+        return torch.cat(out_sets, dim = 1)
+
+    def _fit_memory_budget(self, memory_embeds):
+        """Recursively compress (then truncate) until memory fits the budget.
+
+        Returns (memory_embeds, level, truncated). If `max_levels` is None,
+        recursion continues until the memory fits -- unbounded context in
+        theory. As a final backstop the OLDEST super-tokens are dropped, since
+        the most recent history is the most valuable.
+        """
+        budget = self._memory_budget()
+        level = 1
+        truncated = False
+
+        while memory_embeds.shape[1] > budget and (self.max_levels is None or level < self.max_levels):
+            if memory_embeds.shape[1] <= self.compression_slots:
+                break  # recursion cannot shrink it further
+            memory_embeds = self._compress_memory_level(memory_embeds)
+            level += 1
+
+        if memory_embeds.shape[1] > budget:
+            if budget <= 0:
+                raise ValueError(
+                    f'No room for memory: max_window={self.max_window} consumes the entire '
+                    f'positional budget ({_max_position_embeddings(self.llm.config)}). '
+                    'Lower --max-window.'
+                )
+            memory_embeds = memory_embeds[:, -budget:]
+            truncated = True
+
+        return memory_embeds, level, truncated
+
+    def _simulate_memory(self, seq_len):
+        """Pure-arithmetic mirror of compress_context + _fit_memory_budget.
+
+        Returns (num_memory_tokens, level, truncated) for a padded seq_len
+        without running any modules. Must stay in sync with the tensor path so
+        that compute_loss slices the right number of logit positions.
+        """
+        if seq_len <= self.max_window:
+            return 0, 0, False
+        budget = self._memory_budget()
+        n = math.ceil((seq_len - self.max_window) / self.compression_window) * self.compression_slots
+        level = 1
+        truncated = False
+        while n > budget and (self.max_levels is None or level < self.max_levels):
+            if n <= self.compression_slots:
+                break
+            n = math.ceil(n / self.recursion_window) * self.compression_slots
+            level += 1
+        if n > budget:
+            n = max(budget, 0)
+            truncated = True
+        return n, level, truncated
 
     def num_memory_tokens(self, seq_len):
         """Number of super-tokens produced for a (padded) sequence length."""
-        if seq_len <= self.max_window:
-            return 0
-        overflow_len = seq_len - self.max_window
-        num_chunks = math.ceil(overflow_len / self.compression_window)
-        return num_chunks * self.compression_slots
+        return self._simulate_memory(seq_len)[0]
 
     # ------------------------------------------------------------------
     # Forward
@@ -508,13 +650,21 @@ class MemoryBridgeLLM(nn.Module):
         device = input_ids.device
         B, T = input_ids.shape
 
-        # Compress the initial overflow, if any
+        # Compress the initial overflow, if any. compress_context already
+        # enforces the positional budget, so the prompt starts within budget.
         memory_embeds = self.compress_context(input_ids, llm_tokenizer, encoder_tokenizer, attention_mask)
+        # Keep only as much of the prompt active as fits alongside the memory
+        # prefix (the memory itself has already been budget-limited). The rest
+        # is already represented by the compressed memory.
         if memory_embeds is not None:
             overflow_len = T - self.max_window
             input_ids = input_ids[:, overflow_len:]
             if attention_mask is not None:
                 attention_mask = attention_mask[:, overflow_len:]
+            keep = max(self._memory_budget(), 1)
+            input_ids = input_ids[:, -keep:]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, -keep:]
 
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
@@ -536,15 +686,24 @@ class MemoryBridgeLLM(nn.Module):
 
         for _ in range(max_new_tokens):
             # --------------------------------------------------------------
-            # Rolling window: if the active window is full, slide the oldest
-            # token(s) out and buffer them for re-compression.
+            # Rolling window: keep the active step strictly inside the
+            # positional budget (one spare slot for the token appended this
+            # step). The oldest prompt token is popped first; once the prompt
+            # is exhausted, the oldest generated token is popped instead.
+            # Popped tokens are buffered for re-compression into memory.
             # --------------------------------------------------------------
-            while input_ids.shape[1] >= self.max_window:
-                popped = input_ids[:, 0].item()
+            num_mem_now = memory_embeds.shape[1] if memory_embeds is not None else 0
+            active_budget = max(min(self.max_window, _max_position_embeddings(self.llm.config) - num_mem_now - 1), 1)
+            while input_ids.shape[1] + (generated.shape[1] - 1) >= active_budget:
+                if input_ids.shape[1] > 0:
+                    popped = input_ids[:, 0].item()
+                    input_ids = input_ids[:, 1:]
+                    if attention_mask is not None:
+                        attention_mask = attention_mask[:, 1:]
+                else:
+                    popped = generated[:, 1].item()
+                    generated = torch.cat([generated[:, :1], generated[:, 2:]], dim = 1)
                 pending_overflow.append(popped)
-                input_ids = input_ids[:, 1:]
-                if attention_mask is not None:
-                    attention_mask = attention_mask[:, 1:]
 
             # Re-compress once we have a full compression_window of overflow.
             if len(pending_overflow) >= self.compression_window:
@@ -555,10 +714,15 @@ class MemoryBridgeLLM(nn.Module):
             # Safety valve: if the memory prefix itself is about to exceed the
             # model's positional budget, flush early.
             num_mem = memory_embeds.shape[1] if memory_embeds is not None else 0
-            if num_mem + self.max_window >= _max_position_embeddings(self.llm.config) and pending_overflow:
+            if num_mem + self.max_window > _max_position_embeddings(self.llm.config) - 1 and pending_overflow:
                 new_mem = self._compress_tokens(pending_overflow, llm_tokenizer, encoder_tokenizer)
                 memory_embeds = new_mem if memory_embeds is None else torch.cat([memory_embeds, new_mem], dim = 1)
                 pending_overflow.clear()
+
+            # Enforce the budget on the accumulated memory: fold it one level
+            # deeper rather than letting it grow past the positional budget.
+            if memory_embeds is not None:
+                memory_embeds, _, _ = self._fit_memory_budget(memory_embeds)
                 num_mem = memory_embeds.shape[1]
 
             # --------------------------------------------------------------
@@ -606,6 +770,10 @@ class MemoryBridgeLLM(nn.Module):
             'compression_slots': self.compression_slots,
             'compression_n_heads': self.compression_n_heads,
             'compression_n_layers': self.compression_n_layers,
+            'max_levels': self.max_levels,
+            'recursion_window': self.recursion_window,
+            'recursion_n_heads': self.recursion_n_heads,
+            'recursion_n_layers': self.recursion_n_layers,
             'llm_trainable': self.llm_trainable,
             'encoder_trainable': self.encoder_trainable,
         }
@@ -643,6 +811,10 @@ class MemoryBridgeLLM(nn.Module):
             compression_slots = config['compression_slots'],
             compression_n_heads = config['compression_n_heads'],
             compression_n_layers = config['compression_n_layers'],
+            max_levels = config.get('max_levels', None),
+            recursion_window = config.get('recursion_window', 512),
+            recursion_n_heads = config.get('recursion_n_heads', 8),
+            recursion_n_layers = config.get('recursion_n_layers', 1),
             llm_trainable = config.get('llm_trainable', False),
             encoder_trainable = config.get('encoder_trainable', False),
         )
@@ -680,13 +852,13 @@ def count_parameters(module):
 
 
 def batch_compression_stats(model, seq_len):
-    """(num_chunks, num_super_tokens, compression_ratio) for a padded seq_len."""
+    """(num_chunks, num_super_tokens, compression_ratio, level, truncated) for a padded seq_len."""
     if seq_len <= model.max_window:
-        return 0, 0, None
+        return 0, 0, None, 0, False
     overflow = seq_len - model.max_window
     num_chunks = math.ceil(overflow / model.compression_window)
-    num_super = num_chunks * model.compression_slots
-    return num_chunks, num_super, overflow / num_super
+    num_super, level, truncated = model._simulate_memory(seq_len)
+    return num_chunks, num_super, overflow / num_super, level, truncated
 
 
 def compute_loss(output_logits, input_ids, attention_mask, num_memory_tokens):
@@ -797,6 +969,10 @@ def build_windows_for_generate(tokenized_lists, max_window, min_prompt_tokens, m
 @click.option('--compression-slots', type = int, default = 128, help = 'Latent slots (super-tokens) produced per chunk.')
 @click.option('--compression-n-heads', type = int, default = 8, help = 'Attention heads in the latent compressor.')
 @click.option('--compression-n-layers', type = int, default = 2, help = 'Transformer decoder layers in the latent compressor.')
+@click.option('--max-levels', type = int, default = None, help = 'Max compression depth (1 = no recursion, then truncate). Omit to recurse until the memory fits the positional budget (unbounded in theory).')
+@click.option('--recursion-window', type = int, default = 512, help = 'Super-tokens compressed per recursive chunk.')
+@click.option('--recursion-n-heads', type = int, default = 8, help = 'Attention heads in the recursive compressor.')
+@click.option('--recursion-n-layers', type = int, default = 1, help = 'Transformer decoder layers in the recursive compressor.')
 # ---- freezing ----
 @click.option('--train-encoder', is_flag = True, default = False, help = 'Unfreeze the encoder (default: frozen).')
 @click.option('--train-llm', is_flag = True, default = False, help = 'Unfreeze the LLM (default: frozen).')
@@ -895,10 +1071,15 @@ def run(**cfg):
         compression_slots = cfg['compression_slots'],
         compression_n_heads = cfg['compression_n_heads'],
         compression_n_layers = cfg['compression_n_layers'],
+        max_levels = cfg['max_levels'],
+        recursion_window = cfg['recursion_window'],
+        recursion_n_heads = cfg['recursion_n_heads'],
+        recursion_n_layers = cfg['recursion_n_layers'],
         llm_trainable = cfg['train_llm'],
         encoder_trainable = cfg['train_encoder'],
     )
-    # compressor + bridge + post_norm are always trainable
+    # compressor + bridge + post_norm (and their recursive counterparts) are
+    # always trainable
 
     if cfg['gradient_checkpointing']:
         if cfg['train_llm']:
@@ -913,6 +1094,7 @@ def run(**cfg):
         'encoder': count_parameters(model.encoder),
         'compressor': count_parameters(model.compressor),
         'bridge': count_parameters(model.bridge),
+        'recursion': count_parameters(model.recursion_compressor) + count_parameters(model.recursion_norm) + count_parameters(model.recursion_bridge),
     }
     total_params = sum(t for t, _ in param_report.values())
     trainable_params = sum(tr for _, tr in param_report.values())
@@ -1030,6 +1212,8 @@ def run(**cfg):
         if cfg['wandb_watch']:
             wandb.watch(model.compressor, log = 'all', log_freq = max(1, cfg['log_every']))
             wandb.watch(model.bridge, log = 'all', log_freq = max(1, cfg['log_every']))
+            wandb.watch(model.recursion_compressor, log = 'all', log_freq = max(1, cfg['log_every']))
+            wandb.watch(model.recursion_bridge, log = 'all', log_freq = max(1, cfg['log_every']))
         click.echo(f'W&B run: {wandb_run.url}')
 
     def wandb_log(metrics, step):
@@ -1127,6 +1311,7 @@ def run(**cfg):
     micro_step = 0
     accum_loss, accum_tokens = 0.0, 0
     accum_compressed, accum_super, accum_ratio = 0, 0.0, 0
+    accum_levels, accum_trunc = 0.0, 0
     step_start = time.time()
     stop_training = False
 
@@ -1141,7 +1326,7 @@ def run(**cfg):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             seq_len = input_ids.shape[1]
-            num_chunks, num_super, ratio = batch_compression_stats(model, seq_len)
+            num_chunks, num_super, ratio, level, truncated = batch_compression_stats(model, seq_len)
 
             with torch.autocast(device.type, dtype = amp_dtype, enabled = use_amp):
                 output = model(input_ids, llm_tokenizer, enc_tokenizer, attention_mask = attention_mask)
@@ -1157,6 +1342,8 @@ def run(**cfg):
                 accum_compressed += 1
                 accum_super += num_super
                 accum_ratio += ratio
+                accum_levels += level
+                accum_trunc += int(truncated)
 
             (scaler.scale(loss) if scaler else loss).div(cfg['grad_accum']).backward()
 
@@ -1192,6 +1379,8 @@ def run(**cfg):
                     'compression/batches_with_compression_frac': accum_compressed / max(1, cfg['log_every'] * cfg['grad_accum']),
                     'compression/avg_super_tokens': accum_super / max(1, accum_compressed) if accum_compressed else 0.0,
                     'compression/avg_ratio': accum_ratio / max(1, accum_compressed) if accum_compressed else 0.0,
+                    'compression/avg_levels': accum_levels / max(1, accum_compressed) if accum_compressed else 0.0,
+                    'compression/truncation_frac': accum_trunc / max(1, accum_compressed) if accum_compressed else 0.0,
                 }
                 if use_cuda:
                     metrics['system/gpu_mem_allocated_mb'] = torch.cuda.memory_allocated() / 1024 ** 2
@@ -1203,6 +1392,7 @@ def run(**cfg):
                 )
                 accum_loss, accum_tokens = 0.0, 0
                 accum_compressed, accum_super, accum_ratio = 0, 0.0, 0
+                accum_levels, accum_trunc = 0.0, 0
                 step_start = time.time()
 
             if eval_loader is not None and cfg['eval_every'] > 0 and global_step % cfg['eval_every'] == 0:
