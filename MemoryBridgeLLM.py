@@ -109,8 +109,8 @@ class MemoryBridgeLLM(nn.Module):
         The LLM to use for generation
     encoder_model: PyTorch model
         The encoder to use for generating embeddings
-    max_window int or None (default None)
-        The maximum token window that can be used. If None, determines the value from the encoder and LLMs
+    max_window: int or None (default None)
+        The maximum token window kept uncompressed in the LLM. If None, uses the smaller of the LLM's and the encoder's `max_position_embeddings`. Explicit values larger than this raise ValueError
     compression_window: int (default 8192)
         The number of tokens to compress into one set of "super token" slots
     compression_slots: int (default 128)
@@ -186,7 +186,7 @@ class MemoryBridgeLLM(nn.Module):
         # LayerNorm before the bridge keeps super-token activations in a sane
         # range early in training; compressor/bridge weights are initialized.
         self.post_norm = nn.LayerNorm(self.encoder.config.hidden_size)
-        self.apply(self._init_bridge_weights)
+        self._init_bridge_weights()
         self._apply_freezing()
 
     # ------------------------------------------------------------------
@@ -207,14 +207,19 @@ class MemoryBridgeLLM(nn.Module):
     # Initialization / freezing
     # ------------------------------------------------------------------
 
-    def _init_bridge_weights(self, module):
-        """Initialize only compressor and bridge weights; leave pretrained intact."""
-        if module is self.llm or module is self.encoder:
-            return
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+    def _init_bridge_weights(self):
+        """Initialize only compressor, bridge and post-norm weights; leave pretrained intact.
+
+        Only the newly-created submodules (compressor, bridge, post-norm) are
+        touched. Every nn.Linear found inside them is Xavier-initialized with
+        zeroed bias. Pretrained LLM and encoder weights are never modified.
+        """
+        for module in (self.compressor, self.bridge, self.post_norm):
+            for submodule in module.modules():
+                if isinstance(submodule, nn.Linear):
+                    nn.init.xavier_uniform_(submodule.weight)
+                    if submodule.bias is not None:
+                        nn.init.zeros_(submodule.bias)
 
     def _apply_freezing(self):
         for p in self.encoder.parameters():

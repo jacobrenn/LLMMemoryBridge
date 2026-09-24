@@ -79,6 +79,19 @@ def _max_position_embeddings(config, default=512):
 
 
 class LatentCompressor(nn.Module):
+    """LatentCompressor Network which compresses existing embeddings down using Perceiver-style attention
+
+    Parameters
+    ----------
+    enc_dim: int
+        The input encoding dimension from the encoding model
+    num_slots: int (default 128)
+        Number of "super tokens" to encode to
+    num_heads: int (default 8)
+        The number of attention heads to use in the decoder layer
+    num_layers: int (default 2)
+        The number of decoder layers to use
+    """
     def __init__(
         self,
         enc_dim,
@@ -131,6 +144,31 @@ class MemoryBridgeConfig:
 
 
 class MemoryBridgeLLM(nn.Module):
+    """
+    Memory Bridge LLM
+
+    Parameters
+    ----------
+    llm_model: PyTorch model
+        The LLM to use for generation
+    encoder_model: PyTorch model
+        The encoder to use for generating embeddings
+    max_window: int or None (default None)
+        The maximum token window kept uncompressed in the LLM. If None, uses the smaller of the LLM's and the encoder's `max_position_embeddings`. Explicit values larger than this raise ValueError
+    compression_window: int (default 8192)
+        The number of tokens to compress into one set of "super token" slots
+    compression_slots: int (default 128)
+        The number of "super tokens" to compress each compression window to
+    compression_n_heads: int (default 8)
+        The number of attention heads in the LatentCompressor model
+    compression_n_layers: int (default 2)
+        The number of transformer decoder layers to use in the LatentCompressor model
+    llm_trainable: bool (default False)
+        Whether the LLM is trainable
+    encoder_trainable: bool (default False)
+        Whether the encoder is trainable
+
+    """
 
     CONFIG_FILE = 'memory_bridge_config.json'
 
@@ -192,7 +230,7 @@ class MemoryBridgeLLM(nn.Module):
         # LayerNorm before the bridge keeps super-token activations in a sane
         # range early in training; compressor/bridge weights are initialized.
         self.post_norm = nn.LayerNorm(self.encoder.config.hidden_size)
-        self.apply(self._init_bridge_weights)
+        self._init_bridge_weights()
         self._apply_freezing()
 
     # ------------------------------------------------------------------
@@ -213,14 +251,19 @@ class MemoryBridgeLLM(nn.Module):
     # Initialization / freezing
     # ------------------------------------------------------------------
 
-    def _init_bridge_weights(self, module):
-        """Initialize only compressor and bridge weights; leave pretrained intact."""
-        if module is self.llm or module is self.encoder:
-            return
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+    def _init_bridge_weights(self):
+        """Initialize only compressor, bridge and post-norm weights; leave pretrained intact.
+
+        Only the newly-created submodules (compressor, bridge, post-norm) are
+        touched. Every nn.Linear found inside them is Xavier-initialized with
+        zeroed bias. Pretrained LLM and encoder weights are never modified.
+        """
+        for module in (self.compressor, self.bridge, self.post_norm):
+            for submodule in module.modules():
+                if isinstance(submodule, nn.Linear):
+                    nn.init.xavier_uniform_(submodule.weight)
+                    if submodule.bias is not None:
+                        nn.init.zeros_(submodule.bias)
 
     def _apply_freezing(self):
         for p in self.encoder.parameters():
@@ -690,7 +733,7 @@ def build_windows_for_generate(tokenized_lists, max_window, min_prompt_tokens, m
 @click.option('--llm-name', default = 'aisquared/bolt-instruct-1b', help = 'HF name/path of the causal LM.')
 @click.option('--encoder-name', default = 'aisquared/bolt-embedding-small', help = 'HF name/path of the encoder.')
 # ---- memory bridge architecture ----
-@click.option('--max-window', type = int, default = 1024, help = 'Active (uncompressed) LLM window. Smaller values trigger compression more often.')
+@click.option('--max-window', type = int, default = 4096, help = 'Active (uncompressed) LLM window. Smaller values trigger compression more often.')
 @click.option('--compression-window', type = int, default = 3072, help = 'Overflow tokens compressed per chunk.')
 @click.option('--compression-slots', type = int, default = 128, help = 'Latent slots (super-tokens) produced per chunk.')
 @click.option('--compression-n-heads', type = int, default = 8, help = 'Attention heads in the latent compressor.')
@@ -705,7 +748,7 @@ def build_windows_for_generate(tokenized_lists, max_window, min_prompt_tokens, m
 @click.option('--max-examples', type = int, default = None, help = 'Cap on raw examples loaded before packing.')
 @click.option('--pack-length', type = int, default = 4096, help = 'Token length of packed training sequences.')
 @click.option('--no-packing', is_flag = True, default = False, help = 'Disable sequence packing (one example per row).')
-@click.option('--eval-fraction', type = float, default = 0.02, help = 'Fraction of sequences held out for eval (0 disables).')
+@click.option('--eval-fraction', type = float, default = 0.10, help = 'Fraction of sequences held out for eval (0 disables).')
 # ---- optimization ----
 @click.option('--epochs', type = int, default = 1)
 @click.option('--batch-size', type = int, default = 4)
@@ -727,10 +770,10 @@ def build_windows_for_generate(tokenized_lists, max_window, min_prompt_tokens, m
 @click.option('--max-steps', type = int, default = None, help = 'Stop after this many optimizer steps.')
 # ---- generation sampling ----
 @click.option('--gen-samples', type = int, default = 2, help = 'Number of eval prompts for generation samples (0 disables).')
-@click.option('--gen-max-new-tokens', type = int, default = 32)
+@click.option('--gen-max-new-tokens', type = int, default = 100)
 @click.option('--gen-every', type = int, default = 500, help = 'Generation sample interval in optimizer steps.')
 @click.option('--gen-min-prompt-tokens', type = int, default = 256)
-@click.option('--gen-max-prompt-tokens', type = int, default = 2048)
+@click.option('--gen-max-prompt-tokens', type = int, default = 3072)
 # ---- checkpointing / hub ----
 @click.option('--output-dir', default = './memory-bridge-output')
 @click.option('--save-every', type = int, default = 0, help = 'Save an intermediate checkpoint every N optimizer steps (0 disables).')
