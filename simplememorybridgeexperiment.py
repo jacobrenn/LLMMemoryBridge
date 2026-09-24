@@ -881,6 +881,12 @@ def run(**cfg):
     enc_tokenizer = AutoTokenizer.from_pretrained(cfg['encoder_name'])
     enc_model = AutoModel.from_pretrained(cfg['encoder_name'])
 
+    # Freezing is handled entirely inside MemoryBridgeLLM: pass the trainable
+    # flags through the constructor so that `llm_trainable` / `encoder_trainable`
+    # stay in sync with `requires_grad` (the constructor calls _apply_freezing).
+    # Previously this was done with direct `model.llm.requires_grad_(...)` calls,
+    # which left the flags stale -- silently disabling encoder gradients in
+    # compress_context() and forcing the LLM into eval mode during training.
     model = MemoryBridgeLLM(
         llm_model = llm_model,
         encoder_model = enc_model,
@@ -889,12 +895,10 @@ def run(**cfg):
         compression_slots = cfg['compression_slots'],
         compression_n_heads = cfg['compression_n_heads'],
         compression_n_layers = cfg['compression_n_layers'],
+        llm_trainable = cfg['train_llm'],
+        encoder_trainable = cfg['train_encoder'],
     )
-
-    # ---------------- Freeze / unfreeze ----------------
-    model.llm.requires_grad_(cfg['train_llm'])
-    model.encoder.requires_grad_(cfg['train_encoder'])
-    # compressor + bridge always trainable
+    # compressor + bridge + post_norm are always trainable
 
     if cfg['gradient_checkpointing']:
         if cfg['train_llm']:
